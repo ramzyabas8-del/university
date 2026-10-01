@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+jinja2
+python-multipart
+sqlalchemy
+psycopg[binary]
+pypdf
+python-docx
+openai
+python-dotenv
+itsdangerous

@@ -1,0 +1,1 @@
+{% extends 'base.html' %}{% block content %}<h1>🕘 {{tr('history')}}</h1>{% for r in rows %}<div class="card history"><small>{{r.username}} — {{r.created_at}}</small><h3>{{r.question}}</h3><p>{{r.answer}}</p></div>{% else %}<p>لا يوجد سجل.</p>{% endfor %}{% endblock %}
