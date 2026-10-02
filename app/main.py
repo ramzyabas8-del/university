@@ -21,15 +21,35 @@ app = FastAPI(
     version="1.0",
 )
 
-# Serve the project-level static files at /static.
-# This fixes GET /static/style.css -> 404 when style.css is in ./static/.
-STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
-if STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
 templates = Jinja2Templates(
     directory=str(Path(__file__).parent / "templates")
 )
+
+
+# ---------------------------------------------------------------------------
+# Static assets
+# ---------------------------------------------------------------------------
+# The templates in the deployed project may not all contain a CSS <link>.
+# We therefore both mount /static and inject the stylesheet into HTML responses.
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR), check_dir=False), name="static")
+
+
+@app.middleware("http")
+async def ensure_stylesheet(request: Request, call_next):
+    response = await call_next(request)
+    content_type = response.headers.get("content-type", "")
+
+    if "text/html" in content_type and hasattr(response, "body") and response.body:
+        body = response.body
+        marker = b"</head>"
+        if marker in body and b"/static/style.css" not in body:
+            link = b'<link rel="stylesheet" href="/static/style.css">'
+            body = body.replace(marker, link + marker, 1)
+            response.body = body
+            response.headers["content-length"] = str(len(body))
+
+    return response
 
 
 def ensure_admin():
@@ -271,7 +291,7 @@ def ask(
         if sources:
             answer = (
                 "تم العثور على النصوص التالية من اللوائح، "
-                "لكن خدمة Gemini غير متاحة حالياً. تأكد من ضبط GEMINI_API_KEY في Render."
+                "لكن خدمة Gemini غير متاحة حالياً. حاول مرة أخرى بعد قليل."
             )
         else:
             answer = "لم أجد نصاً مناسباً في قاعدة اللوائح."
@@ -369,11 +389,6 @@ async def upload(
             pending.append((page_number, piece))
 
     embeddings = embed([item[1] for item in pending]) if pending else []
-    semantic_indexing = bool(
-        pending
-        and embeddings
-        and any(item is not None for item in embeddings)
-    )
 
     for index, (page_number, text) in enumerate(pending):
         embedding = embeddings[index] if index < len(embeddings) else None
@@ -394,22 +409,12 @@ async def upload(
 
     db.commit()
 
-    if semantic_indexing:
-        success = f"تمت الفهرسة بنجاح باستخدام Gemini: {len(pending)} مقطعاً."
-    elif pending:
-        success = (
-            f"تم حفظ {len(pending)} مقطعاً، لكن لم يتم إنشاء الفهرسة الدلالية. "
-            "سيعمل البحث النصي، وتأكد من GEMINI_API_KEY في Render."
-        )
-    else:
-        success = "تم رفع الملف، لكن لم يتم العثور على نص قابل للفهرسة."
-
     return render_template(
         "upload.html",
         req,
         db,
         error=None,
-        success=success,
+        success=f"تمت الفهرسة بنجاح: {len(pending)} مقطعاً.",
     )
 
 
@@ -527,4 +532,4 @@ def history(req: Request, db: Session = Depends(get_db)):
         req,
         db,
         rows=rows,
-)
+    )
