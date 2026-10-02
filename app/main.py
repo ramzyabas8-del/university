@@ -3,6 +3,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, Depends, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
@@ -19,6 +20,12 @@ app = FastAPI(
     title="University Regulations AI",
     version="1.0",
 )
+
+# Serve the project-level static files at /static.
+# This fixes GET /static/style.css -> 404 when style.css is in ./static/.
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 templates = Jinja2Templates(
     directory=str(Path(__file__).parent / "templates")
@@ -520,4 +527,4 @@ def history(req: Request, db: Session = Depends(get_db)):
         req,
         db,
         rows=rows,
-    )
+)
