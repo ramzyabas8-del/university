@@ -6,6 +6,6 @@ sqlalchemy
 psycopg[binary]
 pypdf
 python-docx
-openai
+google-genai
 python-dotenv
 itsdangerous
