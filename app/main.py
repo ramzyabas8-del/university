@@ -264,7 +264,7 @@ def ask(
         if sources:
             answer = (
                 "تم العثور على النصوص التالية من اللوائح، "
-                "لكن مفتاح OpenAI غير مفعّل لتوليد إجابة لغوية."
+                "لكن خدمة Gemini غير متاحة حالياً. تأكد من ضبط GEMINI_API_KEY في Render."
             )
         else:
             answer = "لم أجد نصاً مناسباً في قاعدة اللوائح."
@@ -362,6 +362,11 @@ async def upload(
             pending.append((page_number, piece))
 
     embeddings = embed([item[1] for item in pending]) if pending else []
+    semantic_indexing = bool(
+        pending
+        and embeddings
+        and any(item is not None for item in embeddings)
+    )
 
     for index, (page_number, text) in enumerate(pending):
         embedding = embeddings[index] if index < len(embeddings) else None
@@ -382,12 +387,22 @@ async def upload(
 
     db.commit()
 
+    if semantic_indexing:
+        success = f"تمت الفهرسة بنجاح باستخدام Gemini: {len(pending)} مقطعاً."
+    elif pending:
+        success = (
+            f"تم حفظ {len(pending)} مقطعاً، لكن لم يتم إنشاء الفهرسة الدلالية. "
+            "سيعمل البحث النصي، وتأكد من GEMINI_API_KEY في Render."
+        )
+    else:
+        success = "تم رفع الملف، لكن لم يتم العثور على نص قابل للفهرسة."
+
     return render_template(
         "upload.html",
         req,
         db,
         error=None,
-        success=f"تمت الفهرسة بنجاح: {len(pending)} مقطعاً.",
+        success=success,
     )
 
 
