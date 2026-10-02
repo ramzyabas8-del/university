@@ -1,8 +1,12 @@
-"""RAG utilities for the University Regulations AI project.
+"""RAG utilities for University Regulations AI.
 
-This module uses Google's current ``google-genai`` SDK for embeddings and
-answer generation.  Gemini/API failures are logged without exposing the API
-key and do not turn a document upload or question page into HTTP 500 errors.
+Gemini version with:
+- PDF/DOCX/TXT extraction
+- Gemini embeddings
+- Hybrid lexical + semantic retrieval
+- Gemini answer generation
+- Automatic retry for temporary 503/429 API failures
+- Safe logging without exposing secrets
 """
 
 import io
@@ -10,6 +14,7 @@ import json
 import logging
 import math
 import re
+import time
 from typing import Optional
 
 from docx import Document
@@ -27,12 +32,16 @@ from .config import (
 try:
     from google import genai
     from google.genai import types
-except Exception:  # pragma: no cover - depends on installed package
+except Exception:  # pragma: no cover
     genai = None
     types = None
 
-
 logger = logging.getLogger(__name__)
+
+# Temporary Gemini failures should be retried, but not forever.
+MAX_GEMINI_RETRIES = 4
+INITIAL_RETRY_DELAY = 2.0
+MAX_RETRY_DELAY = 12.0
 
 
 def norm(text: str) -> str:
@@ -120,7 +129,6 @@ def cosine(a: list[float], b: list[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(y * y for y in b))
-
     return dot / (na * nb) if na and nb else 0.0
 
 
@@ -141,8 +149,20 @@ def _client():
         return None
 
 
+def _is_retryable_gemini_error(exc: Exception) -> bool:
+    """تحديد أخطاء Gemini المؤقتة التي تستحق إعادة المحاولة."""
+    text = str(exc).upper()
+    retry_codes = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL")
+    return any(code in text for code in retry_codes)
+
+
+def _retry_delay(attempt: int) -> float:
+    """Exponential backoff مع حد أعلى."""
+    return min(INITIAL_RETRY_DELAY * (2 ** attempt), MAX_RETRY_DELAY)
+
+
 def _extract_embedding_values(item) -> Optional[list[float]]:
-    """قراءة قيم embedding من كائن SDK مع دعم الاستجابة الحالية."""
+    """قراءة قيم embedding من كائن SDK أو dict."""
     values = getattr(item, "values", None)
     if values is None and isinstance(item, dict):
         values = item.get("values")
@@ -156,29 +176,12 @@ def _extract_embedding_values(item) -> Optional[list[float]]:
         return None
 
 
-def embed(texts: list[str]) -> list[Optional[list[float]]]:
-    """إنشاء embeddings باستخدام Gemini.
+def _embed_batch(client, batch: list[str]) -> list[Optional[list[float]]]:
+    """إرسال دفعة embeddings مع إعادة المحاولة للأخطاء المؤقتة."""
+    last_error = None
 
-    عند فشل Gemini نرجع None للمقاطع بدلاً من إيقاف رفع الملف بالكامل.
-    """
-    if not texts:
-        return []
-
-    client = _client()
-    if client is None:
-        return [None] * len(texts)
-
-    if not GEMINI_EMBEDDING_MODEL:
-        logger.error("GEMINI_EMBEDDING_MODEL is empty.")
-        return [None] * len(texts)
-
-    result: list[Optional[list[float]]] = []
-    batch_size = 50
-
-    try:
-        for start in range(0, len(texts), batch_size):
-            batch = texts[start : start + batch_size]
-
+    for attempt in range(MAX_GEMINI_RETRIES):
+        try:
             response = client.models.embed_content(
                 model=GEMINI_EMBEDDING_MODEL,
                 contents=batch,
@@ -189,21 +192,54 @@ def embed(texts: list[str]) -> list[Optional[list[float]]]:
                 embeddings = response.get("embeddings")
             embeddings = embeddings or []
 
-            batch_values = [_extract_embedding_values(item) for item in embeddings]
-            result.extend(batch_values)
+            values = [_extract_embedding_values(item) for item in embeddings]
+            while len(values) < len(batch):
+                values.append(None)
+            return values[: len(batch)]
 
-            while len(result) < start + len(batch):
-                result.append(None)
+        except Exception as exc:
+            last_error = exc
+            if not _is_retryable_gemini_error(exc) or attempt == MAX_GEMINI_RETRIES - 1:
+                break
 
-        return result[: len(texts)]
+            delay = _retry_delay(attempt)
+            logger.warning(
+                "Gemini embedding temporary error; retry %d/%d in %.1fs. model=%s status=%s",
+                attempt + 1,
+                MAX_GEMINI_RETRIES - 1,
+                delay,
+                GEMINI_EMBEDDING_MODEL,
+                type(exc).__name__,
+            )
+            time.sleep(delay)
 
-    except Exception:
-        logger.exception(
-            "Gemini embedding request failed. model=%s text_count=%d",
-            GEMINI_EMBEDDING_MODEL,
-            len(texts),
-        )
+    logger.error(
+        "Gemini embedding failed after retries. model=%s error=%s",
+        GEMINI_EMBEDDING_MODEL,
+        str(last_error)[:500] if last_error else "unknown",
+    )
+    return [None] * len(batch)
+
+
+def embed(texts: list[str]) -> list[Optional[list[float]]]:
+    """إنشاء embeddings باستخدام Gemini مع retry للأخطاء المؤقتة."""
+    if not texts:
+        return []
+
+    client = _client()
+    if client is None or not GEMINI_EMBEDDING_MODEL:
+        if not GEMINI_EMBEDDING_MODEL:
+            logger.error("GEMINI_EMBEDDING_MODEL is empty.")
         return [None] * len(texts)
+
+    result: list[Optional[list[float]]] = []
+    batch_size = 50
+
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start : start + batch_size]
+        result.extend(_embed_batch(client, batch))
+
+    return result[: len(texts)]
 
 
 def retrieve(db, query: str):
@@ -232,8 +268,8 @@ def retrieve(db, query: str):
 
     for chunk, regulation in rows:
         lexical_score = lexical(query, chunk.text)
-
         semantic_score = 0.0
+
         if query_vector and chunk.embedding_json:
             try:
                 semantic_score = cosine(
@@ -246,11 +282,11 @@ def retrieve(db, query: str):
                     getattr(chunk, "id", "unknown"),
                 )
 
-        if query_vector:
-            score = 0.45 * lexical_score + 0.55 * semantic_score
-        else:
-            score = lexical_score
-
+        score = (
+            0.45 * lexical_score + 0.55 * semantic_score
+            if query_vector
+            else lexical_score
+        )
         scored.append((score, chunk, regulation))
 
     scored.sort(key=lambda item: item[0], reverse=True)
@@ -268,8 +304,24 @@ def retrieve(db, query: str):
     ]
 
 
+def _generate_answer_once(client, prompt: str, system_instruction: str):
+    """محاولة واحدة لتوليد الإجابة."""
+    return client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            max_output_tokens=1200,
+        ),
+    )
+
+
 def ai_answer(query: str, sources: list[dict]):
-    """توليد إجابة Gemini اعتماداً على المقاطع المسترجعة فقط."""
+    """توليد إجابة Gemini اعتماداً على المقاطع المسترجعة فقط.
+
+    يعيد None إذا كانت خدمة Gemini غير متاحة بعد إعادة المحاولة،
+    حتى يستطيع main.py عرض رسالة مناسبة للمستخدم بدلاً من HTTP 500.
+    """
     client = _client()
 
     if client is None or not sources:
@@ -300,37 +352,47 @@ def ai_answer(query: str, sources: list[dict]):
         f"السؤال:\n{query}"
     )
 
-    try:
-        # نستخدم الإعدادات الأساسية فقط لتجنب تغيير سلوك Gemini 3.x الافتراضي.
-        # توثيق Google الحالي يوضح أن GenerateContentConfig يقبل
-        # system_instruction و max_output_tokens.
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                max_output_tokens=1200,
-            ),
-        )
+    last_error = None
 
-        answer = getattr(response, "text", None)
-        if answer:
-            return answer.strip()
+    for attempt in range(MAX_GEMINI_RETRIES):
+        try:
+            response = _generate_answer_once(
+                client,
+                prompt,
+                system_instruction,
+            )
 
-        logger.error(
-            "Gemini returned no text. model=%s response=%r",
-            GEMINI_MODEL,
-            response,
-        )
-        return None
+            answer = getattr(response, "text", None)
+            if answer:
+                return answer.strip()
 
-    except Exception:
-        # لا نسجل GEMINI_API_KEY. الخطأ الكامل سيظهر في Render Logs
-        # لتحديد السبب الحقيقي (quota/key/model/request/etc.).
-        logger.exception(
-            "Gemini generate_content failed. model=%s source_count=%d",
-            GEMINI_MODEL,
-            len(sources),
-        )
-        return None
-    
+            logger.error(
+                "Gemini returned no text. model=%s response_type=%s",
+                GEMINI_MODEL,
+                type(response).__name__,
+            )
+            return None
+
+        except Exception as exc:
+            last_error = exc
+
+            if not _is_retryable_gemini_error(exc) or attempt == MAX_GEMINI_RETRIES - 1:
+                break
+
+            delay = _retry_delay(attempt)
+            logger.warning(
+                "Gemini answer temporary error; retry %d/%d in %.1fs. model=%s status=%s",
+                attempt + 1,
+                MAX_GEMINI_RETRIES - 1,
+                delay,
+                GEMINI_MODEL,
+                type(exc).__name__,
+            )
+            time.sleep(delay)
+
+    logger.error(
+        "Gemini generate_content failed after retries. model=%s error=%s",
+        GEMINI_MODEL,
+        str(last_error)[:700] if last_error else "unknown",
+    )
+    return None
