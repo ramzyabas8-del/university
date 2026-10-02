@@ -1,28 +1,38 @@
+"""RAG utilities for the University Regulations AI project.
+
+This module uses Google's current ``google-genai`` SDK for embeddings and
+answer generation.  Gemini/API failures are logged without exposing the API
+key and do not turn a document upload or question page into HTTP 500 errors.
+"""
+
 import io
 import json
+import logging
 import math
-import os
 import re
-from typing import Iterable
+from typing import Optional
 
-from pypdf import PdfReader
 from docx import Document
+from pypdf import PdfReader
 
 from .config import (
-    GEMINI_API_KEY,
-    GEMINI_MODEL,
-    GEMINI_EMBEDDING_MODEL,
-    TOP_K,
-    CHUNK_SIZE,
     CHUNK_OVERLAP,
+    CHUNK_SIZE,
+    GEMINI_API_KEY,
+    GEMINI_EMBEDDING_MODEL,
+    GEMINI_MODEL,
+    TOP_K,
 )
 
 try:
     from google import genai
     from google.genai import types
-except Exception:
+except Exception:  # pragma: no cover - depends on installed package
     genai = None
     types = None
+
+
+logger = logging.getLogger(__name__)
 
 
 def norm(text: str) -> str:
@@ -35,7 +45,7 @@ def chunk_text(
     size: int = CHUNK_SIZE,
     overlap: int = CHUNK_OVERLAP,
 ) -> list[str]:
-    """تقسيم النص إلى مقاطع مناسبة للبحث الدلالي."""
+    """تقسيم النص إلى مقاطع مناسبة للبحث."""
     text = norm(text)
     if not text:
         return []
@@ -102,7 +112,7 @@ def lexical(query: str, text: str) -> float:
     return len(a & b) / len(a) if a else 0.0
 
 
-def cosine(a, b) -> float:
+def cosine(a: list[float], b: list[float]) -> float:
     """حساب cosine similarity بين متجهين."""
     if not a or not b or len(a) != len(b):
         return 0.0
@@ -115,21 +125,41 @@ def cosine(a, b) -> float:
 
 
 def _client():
-    """إنشاء عميل Gemini عند توفر المفتاح والمكتبة."""
-    if not GEMINI_API_KEY or genai is None:
+    """إنشاء عميل Gemini بدون كشف المفتاح في السجلات."""
+    if genai is None:
+        logger.error("google-genai SDK is not installed or could not be imported.")
+        return None
+
+    if not GEMINI_API_KEY or not GEMINI_API_KEY.strip():
+        logger.error("GEMINI_API_KEY is empty or missing from the environment.")
         return None
 
     try:
-        return genai.Client(api_key=GEMINI_API_KEY)
+        return genai.Client(api_key=GEMINI_API_KEY.strip())
     except Exception:
+        logger.exception("Failed to initialize the Gemini client.")
         return None
 
 
-def embed(texts: list[str]) -> list[list[float] | None]:
-    """
-    إنشاء embeddings باستخدام Gemini.
-    عند حدوث مشكلة في API لا يفشل رفع الملف بالكامل؛
-    يتم إرجاع None للمقاطع حتى يستمر البحث النصي.
+def _extract_embedding_values(item) -> Optional[list[float]]:
+    """قراءة قيم embedding من كائن SDK مع دعم الاستجابة الحالية."""
+    values = getattr(item, "values", None)
+    if values is None and isinstance(item, dict):
+        values = item.get("values")
+
+    if values is None:
+        return None
+
+    try:
+        return [float(value) for value in values]
+    except (TypeError, ValueError):
+        return None
+
+
+def embed(texts: list[str]) -> list[Optional[list[float]]]:
+    """إنشاء embeddings باستخدام Gemini.
+
+    عند فشل Gemini نرجع None للمقاطع بدلاً من إيقاف رفع الملف بالكامل.
     """
     if not texts:
         return []
@@ -138,9 +168,11 @@ def embed(texts: list[str]) -> list[list[float] | None]:
     if client is None:
         return [None] * len(texts)
 
-    result: list[list[float] | None] = []
+    if not GEMINI_EMBEDDING_MODEL:
+        logger.error("GEMINI_EMBEDDING_MODEL is empty.")
+        return [None] * len(texts)
 
-    # دفعات صغيرة لتقليل حجم الطلب الواحد.
+    result: list[Optional[list[float]]] = []
     batch_size = 50
 
     try:
@@ -152,20 +184,25 @@ def embed(texts: list[str]) -> list[list[float] | None]:
                 contents=batch,
             )
 
-            embeddings = getattr(response, "embeddings", None) or []
+            embeddings = getattr(response, "embeddings", None)
+            if embeddings is None and isinstance(response, dict):
+                embeddings = response.get("embeddings")
+            embeddings = embeddings or []
 
-            for item in embeddings:
-                values = getattr(item, "values", None)
-                result.append(list(values) if values is not None else None)
+            batch_values = [_extract_embedding_values(item) for item in embeddings]
+            result.extend(batch_values)
 
-            # إذا أعاد الخادم عدداً أقل من المطلوب.
             while len(result) < start + len(batch):
                 result.append(None)
 
         return result[: len(texts)]
 
     except Exception:
-        # مهم: لا نعيد 500 عند نفاد الحصة أو خطأ مفتاح Gemini.
+        logger.exception(
+            "Gemini embedding request failed. model=%s text_count=%d",
+            GEMINI_EMBEDDING_MODEL,
+            len(texts),
+        )
         return [None] * len(texts)
 
 
@@ -180,13 +217,16 @@ def retrieve(db, query: str):
         .all()
     )
 
-    query_vector = None
+    if not rows:
+        return []
 
+    query_vector = None
     if GEMINI_API_KEY and genai is not None:
         try:
-            query_vector = embed([query])[0]
+            query_embeddings = embed([query])
+            query_vector = query_embeddings[0] if query_embeddings else None
         except Exception:
-            query_vector = None
+            logger.exception("Unexpected error while embedding the user query.")
 
     scored = []
 
@@ -201,7 +241,10 @@ def retrieve(db, query: str):
                     json.loads(chunk.embedding_json),
                 )
             except Exception:
-                semantic_score = 0.0
+                logger.warning(
+                    "Invalid stored embedding for chunk id=%s",
+                    getattr(chunk, "id", "unknown"),
+                )
 
         if query_vector:
             score = 0.45 * lexical_score + 0.55 * semantic_score
@@ -226,12 +269,14 @@ def retrieve(db, query: str):
 
 
 def ai_answer(query: str, sources: list[dict]):
-    """
-    توليد الإجابة بواسطة Gemini اعتماداً على المقاطع المسترجعة فقط.
-    """
+    """توليد إجابة Gemini اعتماداً على المقاطع المسترجعة فقط."""
     client = _client()
 
     if client is None or not sources:
+        return None
+
+    if not GEMINI_MODEL:
+        logger.error("GEMINI_MODEL is empty.")
         return None
 
     context = "\n\n".join(
@@ -250,25 +295,42 @@ def ai_answer(query: str, sources: list[dict]):
     )
 
     prompt = (
-        f"{system_instruction}\n\n"
-        f"النصوص المسترجعة:\n{context}\n\n"
+        "النصوص المسترجعة من قاعدة لوائح الجامعة:\n\n"
+        f"{context}\n\n"
         f"السؤال:\n{query}"
     )
 
     try:
+        # نستخدم الإعدادات الأساسية فقط لتجنب تغيير سلوك Gemini 3.x الافتراضي.
+        # توثيق Google الحالي يوضح أن GenerateContentConfig يقبل
+        # system_instruction و max_output_tokens.
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                temperature=0.2,
                 max_output_tokens=1200,
             ),
         )
 
         answer = getattr(response, "text", None)
-        return answer.strip() if answer else None
+        if answer:
+            return answer.strip()
+
+        logger.error(
+            "Gemini returned no text. model=%s response=%r",
+            GEMINI_MODEL,
+            response,
+        )
+        return None
 
     except Exception:
-        # يمنع ظهور Internal Server Error عند فشل Gemini.
+        # لا نسجل GEMINI_API_KEY. الخطأ الكامل سيظهر في Render Logs
+        # لتحديد السبب الحقيقي (quota/key/model/request/etc.).
+        logger.exception(
+            "Gemini generate_content failed. model=%s source_count=%d",
+            GEMINI_MODEL,
+            len(sources),
+        )
         return None
+    
